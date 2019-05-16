@@ -1,1 +1,1 @@
-# graphug
+# graph-dispatch-rs
