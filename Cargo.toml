@@ -1,8 +1,8 @@
 [package]
-name = "graphugh"
+name = "graph-dispatch"
 version = "0.1.0"
 authors = ["Simon Rönnberg <seamonr@gmail.com>"]
 edition = "2018"
 
-[dev-dependencies]
+[dependencies]
 rayon = "1.0.3"

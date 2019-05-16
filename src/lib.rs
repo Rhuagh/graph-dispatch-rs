@@ -1,6 +1,10 @@
 use std::collections::HashSet;
 use std::hash::Hash;
 use std::iter::FromIterator;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::mpsc::channel;
+use std::fmt::Debug;
 
 pub struct Graph<T> {
     nodes: Vec<Node<T>>,
@@ -21,8 +25,8 @@ impl<T> Default for Graph<T> {
 }
 
 impl<T> Graph<T>
-where
-    T: Eq + Hash + Clone,
+    where
+        T: Eq + Hash + Clone,
 {
     pub fn new() -> Self {
         Graph::default()
@@ -155,10 +159,10 @@ where
     pub fn is_done(&self) -> bool {
         self.completed.len()
             == self
-                .nodes
-                .iter()
-                .filter(|n| n.is_active(&self.nodes))
-                .count()
+            .nodes
+            .iter()
+            .filter(|n| n.is_active(&self.nodes))
+            .count()
     }
 
     pub fn add_completed(&mut self, id: T) {
@@ -177,7 +181,7 @@ where
             .map(|n| n.id.clone())
     }
 
-    pub fn next_section(&self) -> impl Iterator<Item = &T> + '_ {
+    pub fn next_section(&self) -> impl Iterator<Item=&T> + '_ {
         self.nodes
             .iter()
             .filter(move |n| n.is_active(&self.nodes) && !self.started.contains(&n.id))
@@ -198,52 +202,223 @@ struct Node<T> {
 
 impl<T> Node<T> {
     fn is_ready(&self, completed: &Vec<T>) -> bool
-    where
-        T: PartialEq,
+        where
+            T: PartialEq,
     {
         self.deps.is_empty() || !self.deps.iter().any(|d| !completed.contains(d))
     }
 
     fn is_active(&self, nodes: &Vec<Node<T>>) -> bool
-    where
-        T: PartialEq,
+        where
+            T: PartialEq,
     {
         self.active && self.deps.iter().all(|d| nodes.iter().any(|n| n.id == *d && n.is_active(nodes)))
     }
 }
 
+pub trait Task<D> {
+    fn run(&mut self, res: &D);
+}
+
+pub struct Dispatcher<T, D> {
+    tasks: Vec<Data<'static, T, D>>,
+    graph: Graph<T>,
+}
+
+impl <T, D> Dispatcher<T, D> where T: Eq + Hash + Clone + Send + Sync + Debug + 'static, {
+    pub fn new() -> Self {
+        Dispatcher::default()
+    }
+
+    pub fn insert_empty_task<X>(&mut self, id: T, task: X) where X: Task<D> + Send + 'static {
+        self.tasks.push(Data::new(id.clone(), task));
+        self.graph.insert_empty_node(id);
+    }
+
+    pub fn with_empty_task<X>(mut self, id: T, task: X) -> Self where X: Task<D> + Send + 'static {
+        self.insert_empty_task(id, task);
+        self
+    }
+
+    pub fn insert_task<X>(&mut self, id: T, task: X, deps: &[T]) where X: Task<D> + Send + 'static {
+        self.tasks.push(Data::new(id.clone(), task));
+        self.graph.insert_node(id, deps);
+    }
+
+    pub fn with_task<X>(mut self, id: T, task: X, deps: &[T]) -> Self where X: Task<D> + Send + 'static {
+        self.insert_task(id, task, deps);
+        self
+    }
+
+    pub fn insert_inactive_task<X>(&mut self, id: T, task: X, deps: &[T]) where X: Task<D> + Send + 'static {
+        self.insert_task(id.clone(), task, deps);
+        self.graph.deactivate_node(id);
+    }
+
+    pub fn with_inactive_task<X>(mut self, id: T, task: X, deps: &[T]) -> Self where X: Task<D> + Send + 'static {
+        self.insert_inactive_task(id, task, deps);
+        self
+    }
+
+    pub fn with_dependencies(mut self, id: T, deps: &[T]) -> Self {
+        self.graph.insert_dependencies(id, deps);
+        self
+    }
+
+    pub fn activate_task(&mut self, id: T) {
+        self.graph.activate_node(id);
+    }
+
+    pub fn deactivate_task(&mut self, id: T) {
+        self.graph.deactivate_node(id);
+    }
+
+    pub fn dispatch(&mut self, res: &D) where D: Send + Sync {
+        println!("Dispatching graph");
+        rayon::scope(|s| {
+            let graph = &mut self.graph;
+            let tasks = &mut self.tasks;
+            graph.start();
+            let (tx, rx) = channel();
+
+            while !graph.is_done() {
+                let section: Vec<_> = graph.next_section().cloned().collect();
+                for id in section {
+                    println!("Dispatching task with id {:?}", id);
+                    let tx = tx.clone();
+                    if let Some(mut data) = tasks.iter().find(|d| d.id == id).cloned() {
+                        graph.add_started(id.clone());
+                        s.spawn(move |_| {
+                            data.run(res);
+                            tx.send(id.clone()).unwrap();
+                        });
+                    }
+                }
+
+                let completed_id = rx.recv().unwrap();
+                println!("Task with id {:?} completed", completed_id);
+                graph.add_completed(completed_id);
+            }
+        });
+        println!("Dispatch done");
+    }
+}
+
+impl<T, D> Default for Dispatcher<T, D> {
+    fn default() -> Self {
+        Dispatcher {
+            tasks: Vec::default(),
+            graph: Graph::default(),
+        }
+    }
+}
+
+struct Data<'a, T, D> {
+    task: Arc<Mutex<Box<Task<D> + Send + 'a>>>,
+    id: T,
+}
+
+impl<'a, T, D> Clone for Data<'a, T, D> where T: Clone, {
+    fn clone(&self) -> Self {
+        Data {
+            task: self.task.clone(),
+            id: self.id.clone(),
+        }
+    }
+}
+
+impl<'a, T, D> Data<'a, T, D> {
+    fn new<X>(id: T, task: X) -> Self where X: Task<D> + Send + 'a, {
+        Data {
+            id,
+            task: Arc::new(Mutex::new(Box::new(task))),
+        }
+    }
+
+    fn run(&mut self, res: &D) {
+        let mut task = self.task.lock().unwrap();
+        task.run(res);
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::Graph;
-    use std::sync::mpsc::channel;
+    use crate::Task;
+    use crate::Dispatcher;
+
+    pub struct Resources;
+
+    pub struct Task12;
+
+    impl Task<Resources> for Task12 {
+        fn run(&mut self, _res: &Resources) {
+            println!("Running Task12");
+        }
+    }
+
+    pub struct Task13;
+
+    impl Task<Resources> for Task13 {
+        fn run(&mut self, _res: &Resources) {
+            println!("Running Task13");
+        }
+    }
+
+    pub struct Task14;
+
+    impl Task<Resources> for Task14 {
+        fn run(&mut self, _res: &Resources) {
+            println!("Running Task14");
+        }
+    }
+
+    pub struct Task34;
+
+    impl Task<Resources> for Task34 {
+        fn run(&mut self, _res: &Resources) {
+            println!("Running Task34");
+        }
+    }
+
+    pub struct Task66;
+
+    impl Task<Resources> for Task66 {
+        fn run(&mut self, _res: &Resources) {
+            println!("Running Task66");
+        }
+    }
+
+    pub struct Task77;
+
+    impl Task<Resources> for Task77 {
+        fn run(&mut self, _res: &Resources) {
+            println!("Running Task77");
+        }
+    }
+
+    pub struct Task78;
+
+    impl Task<Resources> for Task78 {
+        fn run(&mut self, _res: &Resources) {
+            println!("Running Task78");
+        }
+    }
 
     #[test]
     fn dispatch() {
-        let mut graph = Graph::<usize>::default()
-            .with_empty_node(12)
-            .with_empty_node(13)
-            .with_node(14, &[34])
-            .with_node(34, &[12])
-            .with_node(66, &[34, 12])
-            .with_inactive_node(77, &[12])
-            .with_node(78, &[77]); // should not be run since a dependency is inactive
-
-        graph.start();
-        let (tx, rx) = channel();
-        while !graph.is_done() {
-            let section : Vec<_> = graph.next_section().cloned().collect();
-            for id in section {
-                println!("Dispatching: {}", id);
-                let tx = tx.clone();
-                rayon::spawn(move || {
-                    println!("Running task for {}", id);
-                    tx.send(id.clone()).unwrap();
-                });
-                graph.add_started(id);
-            }
-            let completed_id = rx.recv().unwrap();
-            println!("Completed: {}", completed_id);
-            graph.add_completed(completed_id);
-        }
+        let mut dispatcher = Dispatcher::new()
+            .with_empty_task(0, Task12)
+            .with_empty_task(1, Task13)
+            .with_task(2, Task14, &[3])
+            .with_task(3, Task34, &[0])
+            .with_task(4, Task66, &[3, 0])
+            .with_inactive_task(5, Task77, &[0])
+            .with_task(6, Task78, &[5]);
+        let res = Resources {};
+        dispatcher.dispatch(&res);
+        dispatcher.activate_task(5);
+        dispatcher.dispatch(&res);
+        dispatcher.deactivate_task(0);
+        dispatcher.dispatch(&res);
     }
 }
